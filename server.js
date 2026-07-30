@@ -1,463 +1,304 @@
-* { box-sizing: border-box; margin: 0; padding: 0; }
+// Novedades — serveur backend
+// API d'authentification, de contacts, de messages + temps réel via Socket.io
+// Base de données SQLite embarquée : aucun serveur de base de données à installer.
 
-html, body {
-  height: 100%;
-  background: #0D1526;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
-  color: #F2F5F9;
-  overflow: hidden;
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const Database = require("better-sqlite3");
+const path = require("path");
+
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
+const PORT = process.env.PORT || 3001;
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "20mb" }));
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+// ---------- Base de données ----------
+const db = new Database(path.join(__dirname, "novedades.db"));
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    avatar_color TEXT DEFAULT '#FF6B47',
+    avatar_url TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER NOT NULL,
+    receiver_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT DEFAULT 'sent',
+    type TEXT DEFAULT 'text',
+    media_data TEXT,
+    file_name TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (sender_id) REFERENCES users(id),
+    FOREIGN KEY (receiver_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    avatar_color TEXT DEFAULT '#2EE6C5',
+    created_by INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (group_id, user_id),
+    FOREIGN KEY (group_id) REFERENCES groups(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS group_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    type TEXT DEFAULT 'text',
+    media_data TEXT,
+    file_name TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id),
+    FOREIGN KEY (sender_id) REFERENCES users(id)
+  );
+`);
+
+// Migrations : ajoute les colonnes si la base existait déjà avant cette mise à jour
+const migrations = [
+  "ALTER TABLE users ADD COLUMN avatar_url TEXT",
+  "ALTER TABLE messages ADD COLUMN type TEXT DEFAULT 'text'",
+  "ALTER TABLE messages ADD COLUMN media_data TEXT",
+  "ALTER TABLE messages ADD COLUMN file_name TEXT",
+  "ALTER TABLE group_messages ADD COLUMN type TEXT DEFAULT 'text'",
+  "ALTER TABLE group_messages ADD COLUMN media_data TEXT",
+  "ALTER TABLE group_messages ADD COLUMN file_name TEXT",
+];
+migrations.forEach((sql) => {
+  try {
+    db.exec(sql);
+  } catch (e) {
+    // la colonne existe déjà, rien à faire
+  }
+});
+
+// ---------- Authentification ----------
+function signToken(user) {
+  return jwt.sign({ id: user.id, name: user.name, phone: user.phone }, JWT_SECRET, {
+    expiresIn: "30d",
+  });
 }
 
-.hidden { display: none !important; }
-
-.c-coral { color: #FF6B47; }
-.c-white { color: #F2F5F9; }
-
-.wordmark { font-size: 22px; font-weight: 800; letter-spacing: 1.5px; }
-.wordmark.small { font-size: 17px; }
-
-/* ---------- Écran d'authentification ---------- */
-.auth-screen {
-  height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Non authentifié" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Session invalide, reconnectez-vous" });
+  }
 }
 
-.auth-card {
-  width: 100%;
-  max-width: 360px;
-  background: #0F1B2D;
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 18px;
-  padding: 32px 24px;
-  text-align: center;
-}
-
-.auth-sub { color: #8A97AC; font-size: 13.5px; margin: 8px 0 24px; }
-
-.auth-tabs {
-  display: flex;
-  background: #16213A;
-  border-radius: 10px;
-  padding: 4px;
-  margin-bottom: 20px;
-}
-
-.auth-tab {
-  flex: 1;
-  padding: 9px 0;
-  background: transparent;
-  border: none;
-  color: #8A97AC;
-  font-size: 13.5px;
-  font-weight: 600;
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-.auth-tab.active { background: #FF6B47; color: #1A0E08; }
-
-.auth-form { display: flex; flex-direction: column; gap: 12px; }
-
-.auth-form input {
-  background: #16213A;
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 10px;
-  padding: 12px 14px;
-  color: #F2F5F9;
-  font-size: 14.5px;
-  outline: none;
-}
-
-.auth-form input:focus { border-color: #2EE6C5; }
-
-.phone-row { display: flex; gap: 8px; }
-.phone-row input { flex: 1; min-width: 0; }
-
-.country-select {
-  background: #16213A;
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 10px;
-  padding: 12px 6px;
-  color: #F2F5F9;
-  font-size: 13px;
-  outline: none;
-  max-width: 118px;
-}
-
-.btn-primary {
-  background: #FF6B47;
-  border: none;
-  border-radius: 10px;
-  padding: 12px 0;
-  color: #1A0E08;
-  font-size: 14.5px;
-  font-weight: 700;
-  cursor: pointer;
-  margin-top: 4px;
-}
-
-.auth-error { color: #FF6B47; font-size: 12.5px; min-height: 16px; }
-
-/* ---------- Application ---------- */
-.app { display: flex; flex-direction: column; height: 100vh; }
-.app-body { flex: 1; display: flex; min-height: 0; }
-
-.filter-tabs {
-  display: flex;
-  gap: 8px;
-  padding: 2px 14px 12px;
-  overflow-x: auto;
-}
-
-.filter-tab {
-  background: #16213A;
-  border: none;
-  border-radius: 20px;
-  padding: 7px 14px;
-  color: #97A3B8;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.filter-tab.active { background: #2EE6C5; color: #0D1526; }
-
-.bottom-nav {
-  display: flex;
-  border-top: 1px solid rgba(255,255,255,0.08);
-  background: #0F1B2D;
-  flex-shrink: 0;
-  padding-bottom: env(safe-area-inset-bottom);
-}
-
-.nav-item {
-  flex: 1;
-  background: transparent;
-  border: none;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  padding: 8px 0 6px;
-  color: #5C6B84;
-  cursor: pointer;
-}
-
-.nav-item.active { color: #2EE6C5; }
-.nav-icon { font-size: 19px; }
-.nav-label { font-size: 10.5px; font-weight: 600; }
-.nav-avatar { width: 22px; height: 22px; font-size: 9px; }
-
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  width: 360px;
-  border-right: 1px solid rgba(255,255,255,0.06);
-  background: #0F1B2D;
-}
-
-.sidebar-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 18px 18px 14px;
-}
-
-.icon-btn {
-  background: transparent;
-  border: none;
-  color: #97A3B8;
-  font-size: 17px;
-  cursor: pointer;
-  padding: 6px;
-}
-
-.search-wrap { margin: 0 14px 10px; }
-
-.search-wrap input {
-  width: 100%;
-  background: #16213A;
-  border: none;
-  border-radius: 10px;
-  padding: 9px 12px;
-  color: #F2F5F9;
-  font-size: 14px;
-  outline: none;
-}
-
-.header-actions { display: flex; gap: 4px; }
-
-.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
-.avatar-lg { width: 84px; height: 84px; font-size: 26px; margin: 0 auto; }
-
-.contact-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
-
-.contact-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 10px;
-  border: none;
-  border-radius: 12px;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-
-.contact-row:hover, .contact-row.active { background: #1E2A47; }
-
-.fav-star {
-  flex-shrink: 0;
-  font-size: 16px;
-  color: #5C6B84;
-  padding: 4px;
-  cursor: pointer;
-}
-.fav-star.active { color: #F5B942; }
-
-.row-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
-
-.unread-badge {
-  background: #FF6B47;
-  color: #1A0E08;
-  font-size: 11px;
-  font-weight: 700;
-  min-width: 18px;
-  height: 18px;
-  border-radius: 9px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 5px;
-  flex-shrink: 0;
-}
-
-.avatar {
-  width: 44px; height: 44px;
-  border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  color: #0D1526; font-weight: 700; font-size: 14px;
-  flex-shrink: 0;
-}
-
-.contact-meta { flex: 1; min-width: 0; }
-.row-top { display: flex; justify-content: space-between; align-items: baseline; }
-.row-name { color: #F2F5F9; font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.row-time { color: #5C6B84; font-size: 11.5px; margin-left: 8px; flex-shrink: 0; }
-.row-preview { color: #8A97AC; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
-.row-preview.unread { color: #F2F5F9; font-weight: 600; }
-
-.chat-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-
-.empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: #97A3B8; font-size: 14px; }
-
-.chat-view { flex: 1; display: flex; flex-direction: column; height: 100%; }
-
-.chat-header {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-  background: #0F1B2D;
-}
-
-.back-btn { display: none; }
-
-.chat-status { font-size: 12px; color: #5C6B84; }
-
-.messages { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 8px; }
-
-.bubble-wrap { display: flex; width: 100%; }
-.bubble-wrap.me { justify-content: flex-end; }
-.bubble-wrap.them { justify-content: flex-start; }
-
-.bubble {
-  max-width: 72%;
-  padding: 9px 12px;
-  border-radius: 16px;
-  font-size: 14.5px;
-  line-height: 1.4;
-}
-
-.bubble.me { background: #FF6B47; color: #1A0E08; border-bottom-right-radius: 3px; }
-.bubble.them { background: #1E2A47; color: #F2F5F9; border-bottom-left-radius: 3px; }
-
-.bubble-time { display: block; font-size: 10.5px; opacity: 0.7; margin-top: 4px; text-align: right; }
-
-.composer {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 14px;
-  border-top: 1px solid rgba(255,255,255,0.06);
-  background: #0F1B2D;
-}
-
-.composer input {
-  flex: 1;
-  background: #16213A;
-  border: none;
-  border-radius: 20px;
-  padding: 11px 14px;
-  color: #F2F5F9;
-  font-size: 14.5px;
-  outline: none;
-}
-
-.send-btn {
-  background: #FF6B47;
-  border: none;
-  width: 38px; height: 38px;
-  border-radius: 50%;
-  color: #1A0E08;
-  font-size: 16px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.attach-btn {
-  background: transparent;
-  border: none;
-  font-size: 20px;
-  cursor: pointer;
-  flex-shrink: 0;
-  color: #8A97AC;
-}
-
-.msg-media-image {
-  display: block;
-  max-width: 100%;
-  max-height: 260px;
-  border-radius: 12px;
-  margin-bottom: 6px;
-  object-fit: cover;
-}
-
-.msg-media-video {
-  display: block;
-  max-width: 100%;
-  max-height: 260px;
-  border-radius: 12px;
-  margin-bottom: 6px;
-}
-
-.msg-media-doc {
-  display: block;
-  background: rgba(255,255,255,0.08);
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin-bottom: 6px;
-  color: inherit;
-  text-decoration: none;
-  font-size: 13.5px;
-  word-break: break-all;
-}
-
-/* ---------- Fenêtre modale ---------- */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-  padding: 20px;
-}
-
-.modal-card {
-  width: 100%;
-  max-width: 380px;
-  background: #0F1B2D;
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
-  padding: 22px;
-}
-
-.modal-card h3 { font-size: 16px; margin-bottom: 14px; }
-
-.modal-card input {
-  width: 100%;
-  background: #16213A;
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 10px;
-  padding: 11px 13px;
-  color: #F2F5F9;
-  font-size: 14px;
-  outline: none;
-  margin-bottom: 14px;
-}
-
-.modal-label { font-size: 12.5px; color: #8A97AC; margin-bottom: 8px; }
-
-.group-members-list {
-  max-height: 200px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 8px;
-}
-
-.member-check {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 14px;
-}
-
-.member-check:hover { background: #16213A; }
-
-.modal-actions { display: flex; gap: 10px; margin-top: 10px; }
-
-.btn-secondary {
-  flex: 1;
-  background: #16213A;
-  border: none;
-  border-radius: 10px;
-  padding: 11px 0;
-  color: #F2F5F9;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.modal-actions .btn-primary { flex: 1; margin-top: 0; }
-
-.profile-card { text-align: center; }
-
-.profile-avatar-btn {
-  position: relative;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  margin-bottom: 14px;
-}
-
-.avatar-edit-badge {
-  position: absolute;
-  bottom: 0; right: 0;
-  background: #16213A;
-  border-radius: 50%;
-  padding: 4px 6px;
-  font-size: 12px;
-}
-
-.profile-name { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
-.profile-phone { color: #8A97AC; font-size: 13.5px; margin-bottom: 20px; }
-.profile-logout { color: #FF6B47; margin-bottom: 8px; }
-.soon-text { color: #8A97AC; font-size: 14px; margin-bottom: 4px; }
-
-@media (max-width: 820px) {
-  .sidebar { width: 100%; }
-  .app.show-chat .sidebar { display: none; }
-  .app.show-chat .bottom-nav { display: none; }
-  .app:not(.show-chat) .chat-pane { display: none; }
-  .back-btn { display: inline-block; }
-          }
-  
+app.post("/api/auth/register", (req, res) => {
+  const { name, phone, password } = req.body;
+  if (!name || !phone || !password) {
+    return res.status(400).json({ error: "Nom, téléphone et mot de passe requis" });
+  }
+  const existing = db.prepare("SELECT id FROM users WHERE phone = ?").get(phone);
+  if (existing) return res.status(409).json({ error: "Ce numéro est déjà utilisé" });
+
+  const colors = ["#FF6B47", "#2EE6C5", "#8B7CF6", "#F5B942"];
+  const color = colors[Math.floor(Math.random() * colors.length)];
+  const hash = bcrypt.hashSync(password, 10);
+  const info = db
+    .prepare("INSERT INTO users (name, phone, password_hash, avatar_color) VALUES (?, ?, ?, ?)")
+    .run(name, phone, hash, color);
+
+  const user = { id: info.lastInsertRowid, name, phone };
+  res.json({ token: signToken(user), user });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const { phone, password } = req.body;
+  const user = db.prepare("SELECT * FROM users WHERE phone = ?").get(phone);
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: "Numéro ou mot de passe incorrect" });
+  }
+  res.json({
+    token: signToken(user),
+    user: {
+      id: user.id,
+      name: user.name,
+      phone: user.phone,
+      avatar_color: user.avatar_color,
+      avatar_url: user.avatar_url,
+    },
+  });
+});
+
+// Mettre à jour son propre profil (photo de profil)
+app.patch("/api/me", authMiddleware, (req, res) => {
+  const { avatar_url } = req.body;
+  db.prepare("UPDATE users SET avatar_url = ? WHERE id = ?").run(avatar_url || null, req.user.id);
+  const user = db.prepare("SELECT id, name, phone, avatar_color, avatar_url FROM users WHERE id = ?").get(req.user.id);
+  res.json(user);
+});
+
+// ---------- Contacts ----------
+app.get("/api/contacts", authMiddleware, (req, res) => {
+  const contacts = db
+    .prepare("SELECT id, name, phone, avatar_color, avatar_url FROM users WHERE id != ?")
+    .all(req.user.id);
+  res.json(contacts);
+});
+
+// ---------- Groupes ----------
+app.get("/api/groups", authMiddleware, (req, res) => {
+  const groups = db
+    .prepare(
+      `SELECT g.* FROM groups g
+       JOIN group_members gm ON gm.group_id = g.id
+       WHERE gm.user_id = ?`
+    )
+    .all(req.user.id);
+  res.json(groups);
+});
+
+app.post("/api/groups", authMiddleware, (req, res) => {
+  const { name, memberIds } = req.body;
+  if (!name || !Array.isArray(memberIds) || memberIds.length === 0) {
+    return res.status(400).json({ error: "Nom du groupe et au moins un membre requis" });
+  }
+  const colors = ["#FF6B47", "#2EE6C5", "#8B7CF6", "#F5B942"];
+  const color = colors[Math.floor(Math.random() * colors.length)];
+  const info = db
+    .prepare("INSERT INTO groups (name, avatar_color, created_by) VALUES (?, ?, ?)")
+    .run(name.trim(), color, req.user.id);
+  const groupId = info.lastInsertRowid;
+
+  const addMember = db.prepare("INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)");
+  addMember.run(groupId, req.user.id);
+  memberIds.forEach((id) => addMember.run(groupId, id));
+
+  const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId);
+  res.json(group);
+});
+
+app.get("/api/groups/:groupId/messages", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare("SELECT * FROM group_messages WHERE group_id = ? ORDER BY created_at ASC")
+    .all(req.params.groupId);
+  res.json(rows);
+});
+
+app.post("/api/groups/:groupId/messages", authMiddleware, (req, res) => {
+  const { text, type, media, fileName } = req.body;
+  const groupId = req.params.groupId;
+  const isMedia = type && type !== "text" && media;
+  if (!isMedia && (!text || !text.trim())) {
+    return res.status(400).json({ error: "Message vide" });
+  }
+
+  const info = db
+    .prepare(
+      "INSERT INTO group_messages (group_id, sender_id, text, type, media_data, file_name) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .run(groupId, req.user.id, (text || "").trim(), type || "text", media || null, fileName || null);
+  const message = db.prepare("SELECT * FROM group_messages WHERE id = ?").get(info.lastInsertRowid);
+
+  const members = db
+    .prepare("SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?")
+    .all(groupId, req.user.id);
+  members.forEach(({ user_id }) => {
+    const socketId = onlineUsers.get(String(user_id));
+    if (socketId) io.to(socketId).emit("group:message", { ...message, group_id: Number(groupId) });
+  });
+
+  res.json(message);
+});
+
+// ---------- Messages ----------
+app.get("/api/messages/:contactId", authMiddleware, (req, res) => {
+  const { contactId } = req.params;
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages
+       WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+       ORDER BY created_at ASC`
+    )
+    .all(req.user.id, contactId, contactId, req.user.id);
+  res.json(rows);
+});
+
+app.post("/api/messages", authMiddleware, (req, res) => {
+  const { receiverId, text, type, media, fileName } = req.body;
+  const isMedia = type && type !== "text" && media;
+  if (!receiverId || (!isMedia && (!text || !text.trim()))) {
+    return res.status(400).json({ error: "Message vide" });
+  }
+  const info = db
+    .prepare(
+      "INSERT INTO messages (sender_id, receiver_id, text, type, media_data, file_name) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .run(req.user.id, receiverId, (text || "").trim(), type || "text", media || null, fileName || null);
+
+  const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
+
+  // Livraison en temps réel si le destinataire est connecté
+  const receiverSocket = onlineUsers.get(String(receiverId));
+  if (receiverSocket) {
+    io.to(receiverSocket).emit("message:new", message);
+  }
+  res.json(message);
+});
+
+// ---------- Temps réel (présence + messages) ----------
+const onlineUsers = new Map(); // userId -> socketId
+
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    socket.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (e) {
+    next(new Error("Authentification socket invalide"));
+  }
+});
+
+io.on("connection", (socket) => {
+  const userId = String(socket.user.id);
+  onlineUsers.set(userId, socket.id);
+  io.emit("presence:update", { userId, online: true });
+
+  socket.on("disconnect", () => {
+    onlineUsers.delete(userId);
+    io.emit("presence:update", { userId, online: false });
+  });
+});
+
+app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+
+server.listen(PORT, () => {
+  console.log(`Novedades backend en écoute sur le port ${PORT}`);
+});
+    
